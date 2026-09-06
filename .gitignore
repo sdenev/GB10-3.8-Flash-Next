@@ -1,0 +1,7 @@
+# Everything setup.sh puts inside the project.
+# .cache is the 135 GB checkpoint, .work the clone + the 12.8 GB HashK table.
+.cache/
+.work/
+# Run logs, including rotations like setup.log.1
+*.log
+*.log.*
