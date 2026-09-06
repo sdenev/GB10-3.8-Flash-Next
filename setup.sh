@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  setup.sh -- one-shot setup for Qwen3.8-Flash-Next on this DGX Spark.
+#  setup.sh -- one-shot setup for Qwen3.8-Flash-Next on a DGX Spark.
 #
 #  Wraps install-3.8flash.sh with the steps it assumes you already did by hand:
 #
@@ -9,7 +9,7 @@
 #    3  pre-pull the container image (14 GB) -- see NOTE below
 #    4  run install-3.8flash.sh              -- writes ~/launch-3.8flash.sh
 #
-#  Everything heavy lands INSIDE this project, like the 27B repo next door:
+#  Everything heavy lands INSIDE the repo, so a checkout is self-contained:
 #
 #    ./.cache/huggingface   135 GB  checkpoint      (HF_HOME)
 #    ./.work                 13 GB  patches + HashK (WORK)
@@ -18,6 +18,8 @@
 #  Override either with  HF_HOME=/elsewhere ./setup.sh  or  WORK=/elsewhere.
 #  To reclaim the disk later: ./stop.sh, then sudo rm -rf .cache .work
 #  (sudo because the HashK build runs as root inside the container).
+#
+#  Measurements and findings from running this: LOG.md
 #
 #  NOTE on step 3: install-3.8flash.sh probes the GPU by running the image
 #  before its own pull phase, with stderr sent to /dev/null. If the image is
@@ -41,6 +43,18 @@ IMAGE="$(sed -n 's/^IMAGE="\(.*\)"$/\1/p' "$INSTALLER" 2>/dev/null | head -1)"
 # Project-local by default. Exported so install-3.8flash.sh picks them up:
 # it reads HF_HOME at :23 and WORK at :25, and seds the resolved cache path
 # permanently into the launcher at :615.
+# Load optional ./.env overrides. Shell env wins; .env fills the gaps; the
+# defaults below apply last. Mirrored in start.sh -- keep the two in sync.
+ENV_FILE=".env"
+if [ -f "$ENV_FILE" ]; then
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    key="${key%$'\r'}"; value="${value%$'\r'}"
+    key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+    case "$key" in ''|\#*) continue ;; esac
+    [ -z "${!key:-}" ] && export "$key=$value"
+  done < "$ENV_FILE"
+fi
+
 PROJECT="$PWD"
 export HF_HOME="${HF_HOME:-$PROJECT/.cache/huggingface}"
 export WORK="${WORK:-$PROJECT/.work}"
@@ -135,12 +149,10 @@ fi
 # /opt/sglang, and /usr/local/lib/python3.12/dist-packages is not on sys.path
 # at all. The directory exists but is empty, so Docker would happily create the
 # file there and nothing would ever import it -- the sm_121 fix would silently
-# not apply. Evidence for the replacement path, checked against this image:
-#   * `import flash_attn.cute.flash_fwd` resolves to the /opt/sglang copy
-#   * qwen_sparse_attn_backend.py:83 imports top-level `flash_attn.cute.*`
-#   * the patch differs from the /opt/sglang copy by ONE line (the sm_121 TMA
-#     guard `and mCuSeqlensQ is None`), and from sglang's vendored copy by 508
-# Remove an entry here if upstream fixes its path; the check below will tell you.
+# not apply. `import flash_attn.cute.flash_fwd`
+# resolves to the /opt/sglang copy, and the patch is a one-line diff against it
+# -- see LOG.md section 1 for the derivation. Remove an entry here if upstream
+# fixes its path; the check below will tell you.
 MOUNT_FIXUPS="/usr/local/lib/python3.12/dist-packages/flash_attn/cute/flash_fwd.py|/opt/sglang/lib/python3.12/site-packages/flash_attn/cute/flash_fwd.py"
 
 remap(){
@@ -200,6 +212,18 @@ for pair in $MOUNT_FIXUPS; do
     echo "    remapped bind target -> $r"
   fi
 done
+
+# Make the concurrency knobs env-driven. Upstream hardcodes them as literals,
+# unlike PORT/CTX/MEM_FRACTION which are already ${VAR:-default}. MAX_RUNNING
+# matters more than it looks: req_to_token is allocated as
+#   (max_running_requests + 1) x context_length x 4 bytes
+# which at 8 requests and 200k context is 7.2 GB -- an order of magnitude more
+# than the KV pool it competes with. Lowering it hands that memory to the pool.
+if grep -q -- '--max-running-requests 8 --max-mamba-cache-size 24' "$LAUNCHER"; then
+  sed -i 's|--max-running-requests 8 --max-mamba-cache-size 24|--max-running-requests ${MAX_RUNNING:-8} --max-mamba-cache-size ${MAMBA_CACHE:-24}|' "$LAUNCHER" \
+    || die "could not parameterize the concurrency flags in $LAUNCHER"
+  echo "    concurrency flags -> MAX_RUNNING / MAMBA_CACHE env-driven"
+fi
 
 FINAL="$(extract_mounts "$LAUNCHER" | tr '\n' ' ')"
 BAD="$(docker run --rm --entrypoint sh "$IMAGE" -c \

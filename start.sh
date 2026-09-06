@@ -10,21 +10,41 @@
 #    MODE=1|2        1 = HashK R=4 n-gram table, 200k ctx  (default, best quality)
 #                    2 = PLE off, 256k ctx, better for 4+ concurrent sessions
 #    PORT=30000      MEM_FRACTION=0.90
+#    MAX_RUNNING=8   concurrent requests; also sizes req_to_token
+#    MAMBA_CACHE=24  mamba slots (~60 MB each); 5 reserved per running request
 #    CTX=            context length; defaults per MODE
 #    THINKING=medium off | low | medium | xhigh
 #
 #  Boot takes about 9 minutes. Follow along with: docker logs -f flashnext
+#
+#  Measurements and findings from running this: LOG.md
 # ============================================================================
 set -uo pipefail
 
 LAUNCHER="$HOME/launch-3.8flash.sh"
 CONTAINER="flashnext"
 
+# Load optional ./.env overrides. Shell env wins; .env fills the gaps; the
+# defaults below apply last. Mirrored in setup.sh -- keep the two in sync.
+ENV_FILE=".env"
+if [ -f "$ENV_FILE" ]; then
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    key="${key%$'\r'}"; value="${value%$'\r'}"
+    key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+    case "$key" in ''|\#*) continue ;; esac
+    [ -z "${!key:-}" ] && export "$key=$value"
+  done < "$ENV_FILE"
+fi
+
 # The launcher reads these from the environment, so export rather than assign.
 export MODE="${MODE:-1}"
 export PORT="${PORT:-30000}"
 export THINKING="${THINKING:-medium}"
 export MEM_FRACTION="${MEM_FRACTION:-0.90}"
+# Concurrency. MAX_RUNNING also sizes req_to_token ((N+1) x CTX x 4 bytes), so
+# lowering it is the biggest single lever on KV pool size.
+export MAX_RUNNING="${MAX_RUNNING:-8}"
+export MAMBA_CACHE="${MAMBA_CACHE:-24}"
 [ -n "${CTX:-}" ] && export CTX
 
 G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; N=$'\033[0m'
@@ -72,7 +92,7 @@ if ss -ltn 2>/dev/null | grep -q ":${PORT} "; then
        Free it, or pick another:  PORT=30001 ./start.sh"
 fi
 
-# ---- the swap warning is a false alarm on this box ------------------------
+# ---- the launcher's swap warning is spurious at exactly 16 GiB ------------
 # The launcher wants >= 16 GiB of swap but reads SwapTotal through awk's %d,
 # which truncates. A 16 GiB swapfile reports a few KB under 16 GiB and so
 # prints as 15, tripping a warning and a 10-second pause. Say so up front.
@@ -89,8 +109,8 @@ if [ "${RAM_GIB:-0}" -lt 105 ]; then
   warn "only ${RAM_GIB} GiB RAM available, this needs ~105. Close other GPU/memory work first."
 fi
 
-printf '\n%s==> starting %s (mode %s, port %s, thinking %s)%s\n\n' \
-  "$G" "$CONTAINER" "$MODE" "$PORT" "$THINKING" "$N"
+printf '\n%s==> starting %s (mode %s, port %s, thinking %s, max_running %s, mamba %s)%s\n\n' \
+  "$G" "$CONTAINER" "$MODE" "$PORT" "$THINKING" "$MAX_RUNNING" "$MAMBA_CACHE" "$N"
 
 "$LAUNCHER" || die "launch failed -- docker logs $CONTAINER"
 

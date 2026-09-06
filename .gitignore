@@ -5,3 +5,6 @@
 # Run logs, including rotations like setup.log.1
 *.log
 *.log.*
+
+# local overrides; .env.sample is the committed template
+.env
