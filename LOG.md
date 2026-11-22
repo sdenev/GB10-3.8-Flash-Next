@@ -134,11 +134,52 @@ Five boots, **identical settings** (`2 / 12`, `CTX` unset):
 97,152  101,952  117,760  144,896  146,816
 ```
 
-Spread 1.51×, mean 121,715. Cause unknown. The draft (NEXTN/MTP) model's
-allocation varies 2.06–2.73 GB across the same boots and correlates only
-loosely (r = −0.60); it looked like a clean determinant at n=4 and broke at
-n=5. Host memory available *after the target weights load* was identical
-(16.95 vs 16.89 GB), which rules out accumulated host pressure.
+Spread 1.51×, mean 121,715.
+
+**Cause (found 2026-11-22): the pool is a ~2 GB remainder of a ~112 GB
+measurement, and that measurement is noisy.** On an integrated GPU, SGLang's
+`get_available_gpu_memory()` (`srt/utils/common.py`) skips
+`torch.cuda.mem_get_info()` and returns `psutil.virtual_memory().available`,
+i.e. the kernel's `MemAvailable` estimate. The pool is then sized in
+`_profile_available_bytes()` (`srt/mem_cache/kv_cache_configurator.py`):
+
+```
+KV = avail_now − pre_model_load_avail × (1 − mem_fraction_static) − mm_reserve − mamba
+```
+
+Worked through for the 146,816 boot (from its startup log):
+
+```
+avail before target load   111.56 GB  → slack 0.10 × 111.56 = 11.16 GB
+avail after draft load      14.60 GB
+mm reserve                   0.10 GB
+mamba (12 slots)             1.36 GB  (conv 0.03 + ssm 0.69 + intermediate 0.63 + 0.01)
+rest                         1.98 GB  → KV allocated 1.82 GB = 146,816 tokens
+```
+
+That is ~12.4 KB per token (target + draft KV), so **each 1 GB of error in
+`MemAvailable` at profile time moves the pool by ~80K tokens.** The whole
+97K–147K spread is about 0.6 GB of wobble in a ~112 GB reading.
+
+`MemAvailable` has plenty of room to wobble that much. It is an estimate that
+shifts with page cache (loading streams the whole 135 GB checkpoint through
+it) and with how much anonymous memory the kernel has swapped out by the time
+of profiling, which varies per boot. The draft numbers above are the same
+effect: the "allocation" is a `MemAvailable` delta, not a count of bytes
+allocated. The draft weights are identical every boot, yet the delta varied
+2.06–2.73 GB. That 0.67 GB spread alone is worth ~54K tokens, the size of the
+observed gap. It correlated only loosely (r = −0.60) because it is one noise
+source among several, not the cause. The earlier check of `MemAvailable` after
+the *target* load (16.95 vs 16.89 GB) was taken at the wrong point: the
+profile reads it after the draft load, one noisy step later.
+
+What follows:
+* No setting raises the floor. `--max-total-tokens` is a cap only (Dead
+  ends), and raising `MEM_FRACTION` above 0.90 trades directly against the
+  runtime reserve. At 0.90 the box idles at ~9 GB available.
+* Booting from a clean state should narrow the spread but won't remove it:
+  run `sync; echo 3 > /proc/sys/vm/drop_caches` and `swapoff -a && swapon -a`
+  first. Untested. Loading itself still churns page cache and swap.
 
 Practical consequence: **read the pool at startup, do not assume it.**
 
@@ -217,7 +258,8 @@ Recorded so they are not retried.
 * **`req_to_token`** is *not* a large buffer. It is
   `(max_running_requests + 1) × context_len × 4` bytes — about **7 MB**, not
   gigabytes. It is not why lowering `MAX_RUNNING` helps.
-* **Host swap/page-cache pressure** does not explain the pool variance; see §5.
+* ~~Host swap/page-cache pressure does not explain the pool variance.~~ Wrong:
+  it does, through the `MemAvailable` reading the pool is sized from. See §5.
 * **HiCache** offloads KV to "host" memory, which on unified memory is the same
   physical RAM. Not attempted.
 * **fp4 KV cache** (`--kv-cache-dtype nvfp4`) would halve bytes/token and is
